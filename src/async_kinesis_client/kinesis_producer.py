@@ -21,10 +21,11 @@ def _get_default_partition_key():
 
 class AsyncKinesisProducer:
 
-    def __init__(self, stream_name, ordered=True, custom_kinesis_client=None):
+    def __init__(self, stream_name, region_name, ordered=True, custom_kinesis_client=None):
 
         self.stream_name = stream_name
         self.ordered = ordered
+        self.region_name = region_name
 
         self.seq = '0'
 
@@ -36,7 +37,7 @@ class AsyncKinesisProducer:
         if custom_kinesis_client is not None:
             client = custom_kinesis_client
         else:
-            client = aioboto3.client('kinesis')
+            client = aioboto3.client('kinesis', region_name=self.region_name)
 
         self.kinesis_client = RetriableKinesisProducer(client=client)
         log.debug("Configured kinesis producer for stream '%s'; ordered=%s",

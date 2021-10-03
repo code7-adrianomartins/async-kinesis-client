@@ -161,7 +161,7 @@ class AsyncKinesisConsumer(StoppableProcess):
     DEFAULT_FALLBACK_TIME_DELTA = 3 * 60    # seconds
 
     def __init__(
-            self, stream_name, checkpoint_table=None, host_key=None, shard_iterator_type=None,
+            self, stream_name, region_name, checkpoint_table=None, host_key=None, shard_iterator_type=None,
             iterator_timestamp=None, shard_iterators=None, recover_from_dynamo=False,
             iterator_sequence_number=None, custom_kinesis_client=None):
         """
@@ -187,6 +187,7 @@ class AsyncKinesisConsumer(StoppableProcess):
         self.iterator_timestamp = iterator_timestamp
         self.iterator_sequence_number = iterator_sequence_number
         self.restricted_shard_iterators = shard_iterators
+        self.region_name = region_name
 
         if recover_from_dynamo and not checkpoint_table:
             raise RuntimeError('Can not use recover_from_dynamo without checkpoint table')
@@ -197,7 +198,7 @@ class AsyncKinesisConsumer(StoppableProcess):
         if custom_kinesis_client is not None:
             self.kinesis_client = custom_kinesis_client
         else:
-            self.kinesis_client = aioboto3.client('kinesis')
+            self.kinesis_client = aioboto3.client('kinesis', region_name=self.region_name)
 
         self.checkpoint_table = checkpoint_table
         self.checkpoint_callback = None
@@ -353,7 +354,8 @@ class AsyncKinesisConsumer(StoppableProcess):
                 dynamodb = DynamoDB(
                     table_name=self.checkpoint_table,
                     shard_id=shard_id,
-                    host_key=self.host_key
+                    host_key=self.host_key,
+                    region_name=self.region_name
                 )
                 # If iterator type is defined and not 'LATEST', we need to drop seq from DynamoDB table
                 drop_seq = self.shard_iterator_type and self.shard_iterator_type != 'LATEST' \

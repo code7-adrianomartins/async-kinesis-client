@@ -20,7 +20,7 @@ class DynamoDB:
 
     DEFAULT_MAX_RETRIES = 5
 
-    def __init__(self, table_name, shard_id, max_retries=DEFAULT_MAX_RETRIES, host_key=None):
+    def __init__(self, table_name, shard_id, region_name, max_retries=DEFAULT_MAX_RETRIES, host_key=None):
         """
         Initialize DynamoDB
         :param table_name:  DynamoDB table name
@@ -30,10 +30,11 @@ class DynamoDB:
         """
         self.table_name = table_name
         self.shard_id = shard_id
+        self.region_name = region_name
         self.shard = {}
         self.host_key = host_key or socket.getfqdn()
         self.lock_holding_time = None
-        table = aioboto3.resource('dynamodb').Table(self.table_name)
+        table = aioboto3.resource('dynamodb', region_name=self.region_name).Table(self.table_name)
         self.dynamo_table = RetriableDynamoDB(table=table, retries=max_retries, retry_sleep_time=1)
 
     async def checkpoint(self, seq):
