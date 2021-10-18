@@ -129,6 +129,8 @@ class AsyncKinesisProducer:
             self.buf_size += record_size
             n += 1
 
+        resp.append(await self.flush())
+
         return resp
 
     async def flush(self):
