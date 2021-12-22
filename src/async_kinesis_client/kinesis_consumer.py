@@ -1,13 +1,16 @@
 import asyncio
 import datetime
 import logging
-
 import aioboto3
-
 from botocore.exceptions import ClientError
+
+import nest_asyncio
+nest_asyncio.apply()
 
 from .dynamodb import DynamoDB
 from .boto_exceptions import RETRY_EXCEPTIONS
+from .kinesis_consumer_manager import consumerManager
+
 
 log = logging.getLogger(__name__.split('.')[-2])
 
@@ -53,7 +56,7 @@ class AsyncShardReader(StoppableProcess):
             this follow these best practices: http://docs.aws.amazon.com/streams/latest/dev/kinesis-low-latency.html
     """
 
-    def __init__(self, shard_id, shard_iter, dynamodb, checkpoint_interval, sleep_time, consumer):
+    def __init__(self, shard_id, shard_iter, dynamodb, checkpoint_interval, sleep_time, consumer, stream_name, stream_data, consumer_type='loop', consumer_name='consumer'):
 
         super().__init__()
 
@@ -71,12 +74,32 @@ class AsyncShardReader(StoppableProcess):
                       dynamodb.table_name, self.checkpoint_interval)
             self.dynamodb = dynamodb
 
-        self.client = consumer._get_kinesis_client()
+        self.boto3_session = consumer._get_boto3_session()
         self.retries = 0
         self.record_count = 0
         self.is_running = True
         self.millis_behind_latest = 0
         self.last_sequence_number = ''
+
+        self.consumer_name = consumer_name
+        self.consumer_type = consumer_type
+        self.stream_data = stream_data
+        self.stream_name = stream_name
+        self.consumer_arn = None
+        self.consumer_full_name = None
+
+        if self.consumer_type == 'enhanced':
+            self.stream_arn = self.stream_data['StreamDescription']['StreamARN']
+            self.run_and_get(self.registerConsumer())
+
+    async def registerConsumer(self):
+        consumer_manager = consumerManager(self.stream_name, self.stream_arn, self.boto3_session, self.consumer_name)        
+        self.consumer_arn, self.consumer_full_name = await consumer_manager.register_consumer()
+
+    def run_and_get(self, coro):
+        task = asyncio.create_task(coro)
+        asyncio.get_running_loop().run_until_complete(task)
+        return task.result()        
 
     async def _get_records(self):
         """
@@ -88,7 +111,8 @@ class AsyncShardReader(StoppableProcess):
             log.debug("Shard %s has been closed, exiting", self.shard_id)
             raise ShardClosedException
         try:
-            resp = await self.client.get_records(ShardIterator=self.shard_iter)
+            async with self.boto3_session.client('kinesis') as client:
+                resp = await client.get_records(ShardIterator=self.shard_iter)
         except ClientError as e:
             code = e.response.get('Error', {}).get('Code')
             if code in RETRY_EXCEPTIONS:
@@ -109,45 +133,98 @@ class AsyncShardReader(StoppableProcess):
         """
 
         callback_coro = self.consumer._get_checkpoint_callback()
-        while True:
-            try:
-                if self._stop:
-                    return
-                records = await self._get_records()
-                if len(records) > 0:
-                    self.last_sequence_number = records[-1]['SequenceNumber']
-                    yield records
 
-                # FIXME: Could there be empty records in the list? If yes, should we filter them out?
-                self.record_count += len(records)
-                if self.record_count > self.checkpoint_interval:
+        if self.consumer_type == 'enhanced':
+            async with self.boto3_session.client('kinesis') as client:
+                try:
+                    if self._stop:
+                        return
+                    else:
+                        subscribe_response  = await client.subscribe_to_shard(
+                            ConsumerARN=self.consumer_arn,
+                            ShardId=self.shard_id,
+                            StartingPosition={'Type': 'LATEST'}
+                        )
 
-                    if callback_coro:
-                        if not await callback_coro(self.shard_id, records[-1]['SequenceNumber']):
-                            raise ShardClosedException('Shard closed by application request')
-                    if self.dynamodb:
-                        await self.dynamodb.checkpoint(seq=records[-1]['SequenceNumber'])
-                    self.record_count = 0
-                self.retries = 0
-            except RetryGetRecordsException as e:
-                sleep_time = min((
-                        30,
-                        (self.retries or 1) * self.sleep_time
-                    ))
-                if self.retries > 5:
-                    log.debug("Retrying get_records (#%d %ds): %s", self.retries + 1, sleep_time, e)
-                if not await self.interruptable_sleep(sleep_time):
-                    return
-                self.retries += 1
-            except ReaderExitException:
-                self.is_running = False
-                self.consumer.reader_exited(self.shard_id)
-            except Exception as e:
-                self.is_running = False
-                # Reporting exit on exceptions
-                log.debug("Shard %s got exception: %s", self.shard_id, e)
-                self.consumer.reader_exited(self.shard_id)
-                raise e
+                        async for event in subscribe_response ['EventStream']:
+                            records = event['SubscribeToShardEvent']['Records']
+                            if len(records) > 0:
+                                self.last_sequence_number = records[-1]['SequenceNumber']
+                                yield records
+
+                            # FIXME: Could there be empty records in the list? If yes, should we filter them out?
+                            self.record_count += len(records)
+                            if self.record_count > self.checkpoint_interval:
+
+                                if callback_coro:
+                                    if not await callback_coro(self.shard_id, records[-1]['SequenceNumber']):
+                                        raise ShardClosedException('Shard closed by application request')
+                                if self.dynamodb:
+                                    await self.dynamodb.checkpoint(seq=records[-1]['SequenceNumber'])
+                                self.record_count = 0
+                            self.retries = 0
+
+                except RetryGetRecordsException as e:
+                    sleep_time = min((
+                            30,
+                            (self.retries or 1) * self.sleep_time
+                        ))
+                    if self.retries > 5:
+                        log.debug("Retrying get_records (#%d %ds): %s", self.retries + 1, sleep_time, e)
+                    if not await self.interruptable_sleep(sleep_time):
+                        return
+                    self.retries += 1
+                except ReaderExitException:
+                    self.is_running = False
+                    self.consumer.reader_exited(self.shard_id)
+                except Exception as e:
+                    self.is_running = False
+                    # Reporting exit on exceptions
+                    log.debug("Shard %s got exception: %s", self.shard_id, e)
+                    self.consumer.reader_exited(self.shard_id)
+                    raise e
+        else:
+            while True:
+                try:
+                    if self._stop:
+                        return
+                    else:
+
+                        records = await self._get_records()
+                        if len(records) > 0:
+                            self.last_sequence_number = records[-1]['SequenceNumber']
+                            yield records
+
+                        # FIXME: Could there be empty records in the list? If yes, should we filter them out?
+                        self.record_count += len(records)
+                        if self.record_count > self.checkpoint_interval:
+
+                            if callback_coro:
+                                if not await callback_coro(self.shard_id, records[-1]['SequenceNumber']):
+                                    raise ShardClosedException('Shard closed by application request')
+                            if self.dynamodb:
+                                await self.dynamodb.checkpoint(seq=records[-1]['SequenceNumber'])
+                            self.record_count = 0
+                        self.retries = 0
+                except RetryGetRecordsException as e:
+                    sleep_time = min((
+                            30,
+                            (self.retries or 1) * self.sleep_time
+                        ))
+                    if self.retries > 5:
+                        log.debug("Retrying get_records (#%d %ds): %s", self.retries + 1, sleep_time, e)
+                    if not await self.interruptable_sleep(sleep_time):
+                        return
+                    self.retries += 1
+                except ReaderExitException:
+                    self.is_running = False
+                    self.consumer.reader_exited(self.shard_id)
+                except Exception as e:
+                    self.is_running = False
+                    # Reporting exit on exceptions
+                    log.debug("Shard %s got exception: %s", self.shard_id, e)
+                    self.consumer.reader_exited(self.shard_id)
+                    raise e
 
 
 class AsyncKinesisConsumer(StoppableProcess):
@@ -163,7 +240,7 @@ class AsyncKinesisConsumer(StoppableProcess):
     def __init__(
             self, stream_name, region_name, checkpoint_table=None, host_key=None, shard_iterator_type=None,
             iterator_timestamp=None, shard_iterators=None, recover_from_dynamo=False,
-            iterator_sequence_number=None, custom_kinesis_client=None):
+            iterator_sequence_number=None, consumer_type='lopp', consumer_name='consumer'):
         """
         Initialize Async Kinesis Consumer
         :param stream_name:              stream name to read from
@@ -176,8 +253,6 @@ class AsyncKinesisConsumer(StoppableProcess):
                                          others
         :param recover_from_dynamo:      If True, try to recover last read sequence number from DynamoDB during the initialization
                                          If successful, shard_iterator_type will be ignored
-        :param custom_kinesis_client (aiobotocore.client.Kinesis, optional): Custom kinesis client to use instead of
-            the basic client instantiated in this class. Leave as None for the default behaviour.
         """
 
         super(AsyncKinesisConsumer, self).__init__()
@@ -193,12 +268,7 @@ class AsyncKinesisConsumer(StoppableProcess):
             raise RuntimeError('Can not use recover_from_dynamo without checkpoint table')
         self.recover_from_dynamodb = recover_from_dynamo
 
-        # Allow a custom kinesis client to be passed in. This allows for setting of any additional parameters in
-        # the client without needing to track them in this library.
-        if custom_kinesis_client is not None:
-            self.kinesis_client = custom_kinesis_client
-        else:
-            self.kinesis_client = aioboto3.client('kinesis', region_name=self.region_name)
+        self.boto3_session = aioboto3.Session(region_name=self.region_name)
 
         self.checkpoint_table = checkpoint_table
         self.checkpoint_callback = None
@@ -208,6 +278,9 @@ class AsyncKinesisConsumer(StoppableProcess):
         self.dynamodb_instances = {}
         self.stream_data = None
         self.force_rescan = True
+
+        self.consumer_type = consumer_type
+        self.consumer_name = consumer_name
 
         self.checkpoint_interval = AsyncKinesisConsumer.DEFAULT_CHECKPOINT_INTERVAL
         self.lock_holding_time = AsyncKinesisConsumer.DEFAULT_LOCK_HOLDING_TIME
@@ -247,8 +320,8 @@ class AsyncKinesisConsumer(StoppableProcess):
     def set_reader_sleep_time(self, sleep_time):
         self.reader_sleep_time = sleep_time
 
-    def _get_kinesis_client(self):
-        return self.kinesis_client
+    def _get_boto3_session(self):
+        return self.boto3_session   
 
     def stop(self):
         for shard_id, reader in self.shard_readers.items():
@@ -278,7 +351,8 @@ class AsyncKinesisConsumer(StoppableProcess):
             if len(dead_readers) > 0 or self.force_rescan:
                 log.debug("Getting description for stream '%s' (live shard readers: %d)",
                           self.stream_name, len(live_readers))
-                stream_data = await self.kinesis_client.describe_stream(StreamName=self.stream_name)
+                async with self.boto3_session.client('kinesis') as client:
+                    stream_data = await client.describe_stream(StreamName=self.stream_name)
                 # TODO: handle StreamStatus -- our stream might not be ready, or might be being deleted
                 # But perhaps it will just throw an exception and that would be the caller's problem
 
@@ -301,15 +375,20 @@ class AsyncKinesisConsumer(StoppableProcess):
                 if shard_id not in self.shard_readers or shard_id in dead_readers:
 
                     # override shard_iterator_type if reader for this shard is being restarted
-                    iterator_args = await self.get_default_iterator_args(shard_id, dead_readers.get(shard_id))
-                    log.debug("%s: iterator arguments: %s", shard_id, iterator_args)
+                    if self.consumer_type == "loop":
+                        iterator_args = await self.get_default_iterator_args(shard_id, dead_readers.get(shard_id))
+                        log.debug("%s: iterator arguments: %s", shard_id, iterator_args)
+                    else:
+                        iterator_args = dict(ShardIteratorType='LATEST')
 
                     # get our iterator
-                    shard_iter = await self.kinesis_client.get_shard_iterator(
-                        StreamName=self.stream_name,
-                        ShardId=shard_id,
-                        **iterator_args
-                    )
+                    async with self.boto3_session.client('kinesis') as client:
+                        shard_iter = await client.get_shard_iterator(
+                            StreamName=self.stream_name,
+                            ShardId=shard_id,
+                            **iterator_args
+                        )
+
                     # create and yield ShardReader
                     shard_reader = AsyncShardReader(
                         shard_id=shard_id,
@@ -317,7 +396,11 @@ class AsyncKinesisConsumer(StoppableProcess):
                         dynamodb=self.dynamodb_instances.get(shard_id),
                         checkpoint_interval=self.checkpoint_interval,
                         sleep_time=self.reader_sleep_time,
-                        consumer=self
+                        consumer=self,
+                        stream_name=self.stream_name,
+                        stream_data=stream_data,
+                        consumer_type=self.consumer_type,
+                        consumer_name=self.consumer_name
                     )
                     self.shard_readers[shard_id] = shard_reader
                     yield shard_reader
@@ -398,6 +481,7 @@ class AsyncKinesisConsumer(StoppableProcess):
                 log.debug("%s: using internally saved last checkpointed seq: %s",
                           shard_id, starting_sequence_number)
             else:
+                starting_sequence_number = "0"
                 log.warning("%s: Can not get last saved checkpointed seq!", shard_id)
 
         # There's a sequence number to restart from
