@@ -45,18 +45,3 @@ class RetriableDynamoDB(RetriableAIOBotoOperation):
 
     async def update_item(self, *args, **kwargs):
         return await self._retry(self.update_item_op, *args, **kwargs)
-
-
-class RetriableKinesisProducer(RetriableAIOBotoOperation):
-
-    def __init__(self, client, retries=3, retry_sleep_time=1):
-        super().__init__(retries=retries, retry_sleep_time=retry_sleep_time, resource=client)
-
-        self.put_record_op = getattr(self.resource, 'put_record')
-        self.put_records_op = getattr(self.resource, 'put_records')
-
-    async def put_record(self, *args, **kwargs):
-        return await self._retry(self.put_record_op, *args, **kwargs)
-
-    async def put_records(self, *args, **kwargs):
-        return await self._retry(self.put_records_op, *args, **kwargs)
