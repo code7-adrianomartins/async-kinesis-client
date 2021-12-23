@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import logging
 import aioboto3
+import atexit
 from botocore.exceptions import ClientError
 
 import nest_asyncio
@@ -85,16 +86,18 @@ class AsyncShardReader(StoppableProcess):
         self.consumer_type = consumer_type
         self.stream_data = stream_data
         self.stream_name = stream_name
+        self.consumer_manage = None
         self.consumer_arn = None
         self.consumer_full_name = None
 
         if self.consumer_type == 'enhanced':
             self.stream_arn = self.stream_data['StreamDescription']['StreamARN']
             self.run_and_get(self.registerConsumer())
+            atexit.register(self.run_and_get, self.consumer_manager.deregister_consumer())
 
     async def registerConsumer(self):
-        consumer_manager = consumerManager(self.stream_name, self.stream_arn, self.boto3_session, self.consumer_name)        
-        self.consumer_arn, self.consumer_full_name = await consumer_manager.register_consumer()
+        self.consumer_manager = consumerManager(self.stream_name, self.stream_arn, self.boto3_session, self.consumer_name)
+        self.consumer_arn, self.consumer_full_name = await self.consumer_manager.register_consumer()
 
     def run_and_get(self, coro):
         task = asyncio.create_task(coro)

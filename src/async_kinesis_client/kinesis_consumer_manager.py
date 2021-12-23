@@ -70,6 +70,5 @@ class consumerManager():
                 StreamARN=self.stream_arn,
                 ConsumerName=self.random_consumer_name
             )
-
-            while self.consumer_exists():
+            while await self.consumer_exists():
                 time.sleep(2)
