@@ -137,33 +137,43 @@ class AsyncShardReader(StoppableProcess):
         if self.consumer_type == 'enhanced':
             async with self.boto3_session.client('kinesis') as client:
                 try:
-                    if self._stop:
-                        return
-                    else:
-                        subscribe_response  = await client.subscribe_to_shard(
-                            ConsumerARN=self.consumer_arn,
-                            ShardId=self.shard_id,
-                            StartingPosition={'Type': 'LATEST'}
-                        )
+                    if self.shard_iter is None:
+                        log.debug("Shard %s has been closed, exiting", self.shard_id)
+                        raise ShardClosedException
+                    try:
+                        if self._stop:
+                            return
+                        else:
+                            while not self._stop:
+                                subscribe_response  = await client.subscribe_to_shard(
+                                    ConsumerARN=self.consumer_arn,
+                                    ShardId=self.shard_id,
+                                    StartingPosition={'Type': 'LATEST'}
+                                )
+                                async for event in subscribe_response ['EventStream']:
+                                    records = event['SubscribeToShardEvent']['Records']
+                                    if len(records) > 0:
+                                        self.last_sequence_number = records[-1]['SequenceNumber']
+                                        yield records
 
-                        async for event in subscribe_response ['EventStream']:
-                            records = event['SubscribeToShardEvent']['Records']
-                            if len(records) > 0:
-                                self.last_sequence_number = records[-1]['SequenceNumber']
-                                yield records
+                                    # FIXME: Could there be empty records in the list? If yes, should we filter them out?
+                                    self.record_count += len(records)
+                                    if self.record_count > self.checkpoint_interval:
 
-                            # FIXME: Could there be empty records in the list? If yes, should we filter them out?
-                            self.record_count += len(records)
-                            if self.record_count > self.checkpoint_interval:
-
-                                if callback_coro:
-                                    if not await callback_coro(self.shard_id, records[-1]['SequenceNumber']):
-                                        raise ShardClosedException('Shard closed by application request')
-                                if self.dynamodb:
-                                    await self.dynamodb.checkpoint(seq=records[-1]['SequenceNumber'])
-                                self.record_count = 0
-                            self.retries = 0
-
+                                        if callback_coro:
+                                            if not await callback_coro(self.shard_id, records[-1]['SequenceNumber']):
+                                                raise ShardClosedException('Shard closed by application request')
+                                        if self.dynamodb:
+                                            await self.dynamodb.checkpoint(seq=records[-1]['SequenceNumber'])
+                                        self.record_count = 0
+                                    self.retries = 0
+                    except ClientError as e:
+                        code = e.response.get('Error', {}).get('Code')
+                        if code in RETRY_EXCEPTIONS:
+                            raise RetryGetRecordsException
+                        else:
+                            log.error("Client error occurred while reading: %s", e)
+                            raise ReaderExitException
                 except RetryGetRecordsException as e:
                     sleep_time = min((
                             30,
