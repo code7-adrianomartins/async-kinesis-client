@@ -2,6 +2,8 @@ import logging
 import time
 
 import aioboto3
+import asyncio
+import contextlib
 
 from .retriable_operations import RetriableKinesisProducer
 
@@ -32,12 +34,15 @@ class AsyncKinesisProducer:
         self.record_buf = []
         self.buf_size = 0
 
+        self.context_stack = contextlib.AsyncExitStack()
+
         # Allow a custom kinesis client to be passed in. This allows for setting of any additional parameters in
         # the client without needing to track them in this library.
         if custom_kinesis_client is not None:
             client = custom_kinesis_client
         else:
-            client = aioboto3.client('kinesis', region_name=self.region_name)
+            boto3_session = aioboto3.Session(region_name=region_name)
+            client = asyncio.run(self.context_stack.enter_async_context(boto3_session.client('kinesis')))
 
         self.kinesis_client = RetriableKinesisProducer(client=client)
         log.debug("Configured kinesis producer for stream '%s'; ordered=%s",
