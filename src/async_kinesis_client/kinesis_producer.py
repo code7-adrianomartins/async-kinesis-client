@@ -1,6 +1,9 @@
 import logging
 import time
+
 import aioboto3
+
+from .retriable_operations import RetriableKinesisProducer
 
 log = logging.getLogger(__name__.split('.')[-2])
 
@@ -18,7 +21,7 @@ def _get_default_partition_key():
 
 class AsyncKinesisProducer:
 
-    def __init__(self, stream_name, region_name, ordered=True):
+    def __init__(self, stream_name, region_name, ordered=True, custom_kinesis_client=None):
 
         self.stream_name = stream_name
         self.ordered = ordered
@@ -29,8 +32,14 @@ class AsyncKinesisProducer:
         self.record_buf = []
         self.buf_size = 0
 
-        self.boto3_session = aioboto3.Session(region_name=self.region_name)
+        # Allow a custom kinesis client to be passed in. This allows for setting of any additional parameters in
+        # the client without needing to track them in this library.
+        if custom_kinesis_client is not None:
+            client = custom_kinesis_client
+        else:
+            client = aioboto3.client('kinesis', region_name=self.region_name)
 
+        self.kinesis_client = RetriableKinesisProducer(client=client)
         log.debug("Configured kinesis producer for stream '%s'; ordered=%s",
                   stream_name, ordered)
 
@@ -59,11 +68,10 @@ class AsyncKinesisProducer:
         if explicit_hash_key:
             kwargs['ExplicitHashKey'] = explicit_hash_key
 
-        async with self.boto3_session.client('kinesis') as client:
-            resp = await client.put_record(**kwargs)
-            if self.ordered:
-                self.seq = resp.get('SequenceNumber')
-            return resp
+        resp = await self.kinesis_client.put_record(**kwargs)
+        if self.ordered:
+            self.seq = resp.get('SequenceNumber')
+        return resp
 
     async def put_records(self, records):
         """
@@ -130,11 +138,10 @@ class AsyncKinesisProducer:
         if len(self.record_buf) == 0:
             return
 
-        async with self.boto3_session.client('kinesis') as client:        
-            resp = await client.put_records(
-                Records=self.record_buf,
-                StreamName=self.stream_name
-            )
-            self.record_buf = []
-            self.buf_size = 0
-            return resp
+        resp = await self.kinesis_client.put_records(
+            Records=self.record_buf,
+            StreamName=self.stream_name
+        )
+        self.record_buf = []
+        self.buf_size = 0
+        return resp
