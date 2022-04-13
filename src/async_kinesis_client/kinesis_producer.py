@@ -42,7 +42,8 @@ class AsyncKinesisProducer:
             client = custom_kinesis_client
         else:
             boto3_session = aioboto3.Session(region_name=region_name)
-            client = asyncio.run(self.context_stack.enter_async_context(boto3_session.client('kinesis')))
+            loop = asyncio.get_event_loop()
+            client = loop.run_until_complete(self.context_stack.enter_async_context(boto3_session.client('kinesis')))
 
         self.kinesis_client = RetriableKinesisProducer(client=client)
         log.debug("Configured kinesis producer for stream '%s'; ordered=%s",

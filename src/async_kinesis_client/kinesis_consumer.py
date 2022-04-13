@@ -4,9 +4,6 @@ import logging
 import atexit
 from botocore.exceptions import ClientError
 
-import nest_asyncio
-nest_asyncio.apply()
-
 from .dynamodb import DynamoDB
 from .boto_exceptions import RETRY_EXCEPTIONS
 from .kinesis_consumer_manager import consumerManager
@@ -90,17 +87,16 @@ class AsyncShardReader(StoppableProcess):
 
         if self.consumer_type == 'enhanced':
             self.stream_arn = self.stream_data['StreamDescription']['StreamARN']
-            self.run_and_get(self.registerConsumer())
-            atexit.register(self.run_and_get, self.consumer_manager.deregister_consumer())
+            self.runUntilComplete(self.registerConsumer())
+            atexit.register(self.runUntilComplete, self.consumer_manager.deregister_consumer())
 
     async def registerConsumer(self):
         self.consumer_manager = consumerManager(self.stream_name, self.stream_arn, self.kinesis_client, self.consumer_name)
         self.consumer_arn, self.consumer_full_name = await self.consumer_manager.register_consumer()
-
-    def run_and_get(self, coro):
-        task = asyncio.create_task(coro)
-        asyncio.get_running_loop().run_until_complete(task)
-        return task.result()        
+    
+    def runUntilComplete(self, command):
+        loop = asyncio.get_event_loop() or asyncio.new_event_loop()
+        loop.run_until_complete(command)
 
     async def _get_records(self):
         """
