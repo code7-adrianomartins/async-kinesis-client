@@ -22,12 +22,12 @@ def _get_default_partition_key():
 
 
 class AsyncKinesisProducer:
-
     def __init__(self, stream_name, region_name, ordered=True, custom_kinesis_client=None):
 
         self.stream_name = stream_name
         self.ordered = ordered
         self.region_name = region_name
+        self.custom_kinesis_client = custom_kinesis_client
 
         self.seq = '0'
 
@@ -36,18 +36,16 @@ class AsyncKinesisProducer:
 
         self.context_stack = contextlib.AsyncExitStack()
 
-        # Allow a custom kinesis client to be passed in. This allows for setting of any additional parameters in
-        # the client without needing to track them in this library.
-        if custom_kinesis_client is not None:
-            client = custom_kinesis_client
-        else:
-            boto3_session = aioboto3.Session(region_name=region_name)
-            loop = asyncio.get_event_loop()
-            client = loop.run_until_complete(self.context_stack.enter_async_context(boto3_session.client('kinesis')))
-
-        self.kinesis_client = RetriableKinesisProducer(client=client)
         log.debug("Configured kinesis producer for stream '%s'; ordered=%s",
                   stream_name, ordered)
+
+    async def initialize(self):
+        if self.custom_kinesis_client is not None:
+            client = self.custom_kinesis_client
+        else:
+            boto3_session = aioboto3.Session(region_name=self.region_name)
+            client = await self.context_stack.enter_async_context(boto3_session.client('kinesis'))
+        self.kinesis_client = RetriableKinesisProducer(client=client)
 
     async def put_record(self, record, partition_key=None, explicit_hash_key=None):
         """
