@@ -54,9 +54,13 @@ class RetriableKinesisProducer(RetriableAIOBotoOperation):
 
         self.put_record_op = getattr(self.resource, 'put_record')
         self.put_records_op = getattr(self.resource, 'put_records')
+        self.close_op = getattr(self.resource, 'close')
 
     async def put_record(self, *args, **kwargs):
         return await self._retry(self.put_record_op, *args, **kwargs)
 
     async def put_records(self, *args, **kwargs):
         return await self._retry(self.put_records_op, *args, **kwargs)
+
+    async def close(self, *args, **kwargs):
+        return await self._retry(self.close_op, *args, **kwargs)
