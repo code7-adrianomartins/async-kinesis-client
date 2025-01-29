@@ -111,7 +111,25 @@ class AsyncShardReader(StoppableProcess):
             resp = await self.kinesis_client.get_records(ShardIterator=self.shard_iter)
         except ClientError as e:
             code = e.response.get('Error', {}).get('Code')
-            if code in RETRY_EXCEPTIONS:
+            if code == 'ExpiredIteratorException':
+                # Get a new iterator from the last known sequence number
+                if self.last_sequence_number:
+                    log.error(f"Geting a new iterator from the last known sequence number: {self.last_sequence_number}")
+                    try:
+                        iterator_response = await self.kinesis_client.get_shard_iterator(
+                            StreamName=self.stream_name,
+                            ShardId=self.shard_id,
+                            ShardIteratorType='AFTER_SEQUENCE_NUMBER',
+                            StartingSequenceNumber=self.last_sequence_number
+                        )
+                        self.shard_iter = iterator_response['ShardIterator']
+                        raise RetryGetRecordsException
+                    except ClientError:
+                        log.error("Failed to refresh shard iterator")
+                        raise ReaderExitException
+                else:
+                    raise RetryGetRecordsException
+            elif code in RETRY_EXCEPTIONS:
                 raise RetryGetRecordsException
             else:
                 log.error("Client error occurred while reading: %s", e)
@@ -194,7 +212,6 @@ class AsyncShardReader(StoppableProcess):
                     if self._stop:
                         return
                     else:
-
                         records = await self._get_records()
                         if len(records) > 0:
                             self.last_sequence_number = records[-1]['SequenceNumber']
